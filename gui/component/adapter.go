@@ -4,6 +4,7 @@ import (
 	"EasierConnect/core"
 	"fmt"
 	"log"
+	"runtime"
 )
 
 func Process(host, port, username, password, socksBind string) {
@@ -30,4 +31,6 @@ func Process(host, port, username, password, socksBind string) {
 	log.Printf("Login success, your IP: %d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3])
 
 	client.ServeSocks5(socksBind, false)
+
+	runtime.KeepAlive(client)
 }

@@ -19,4 +19,16 @@
 
 # Go workspace file
 go.work
+
+# IDE
 .idea/
+.vscode/
+
+# Build output
+build_assets/
+
+# macOS
+.DS_Store
+
+# DMG files
+*.dmg

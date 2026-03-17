@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"runtime/debug"
+	"time"
 
 	tls "github.com/refraction-networking/utls"
 )
@@ -24,6 +25,13 @@ func TLSConn(server string) (*tls.UConn, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Enable TCP keepalive to prevent idle connection from being dropped
+	if tcpConn, ok := dialConn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
 	log.Println("socket: connected to: ", dialConn.RemoteAddr())
 
 	// using uTLS to construct a weird TLS Client Hello (required by Sangfor)
@@ -189,7 +197,8 @@ func StartProtocol(endpoint *EasyConnectEndpoint, server string, token *[48]byte
 		for counter < 5 {
 			err := BlockRXStream(server, token, ipRev, endpoint, debug)
 			if err != nil {
-				log.Print("Error occurred while recv, retrying: " + err.Error())
+				log.Printf("Error occurred while recv (attempt %d/5), retrying in %ds: %s", counter+1, (counter+1)*2, err.Error())
+				time.Sleep(time.Duration((counter+1)*2) * time.Second)
 			}
 			counter += 1
 		}
@@ -203,7 +212,8 @@ func StartProtocol(endpoint *EasyConnectEndpoint, server string, token *[48]byte
 		for counter < 5 {
 			err := BlockTXStream(server, token, ipRev, endpoint, debug)
 			if err != nil {
-				log.Print("Error occurred while send, retrying: " + err.Error())
+				log.Printf("Error occurred while send (attempt %d/5), retrying in %ds: %s", counter+1, (counter+1)*2, err.Error())
+				time.Sleep(time.Duration((counter+1)*2) * time.Second)
 			}
 			counter += 1
 		}
