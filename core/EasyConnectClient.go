@@ -8,10 +8,11 @@ import (
 )
 
 type EasyConnectClient struct {
-	queryConn net.Conn
-	clientIp  []byte
-	token     *[48]byte
-	twfId     string
+	queryConn      net.Conn
+	clientIp       []byte
+	token          *[48]byte
+	twfId          string
+	serverSessionId []byte // Raw TLS ServerHello SessionId from ECAgentToken
 
 	endpoint *EasyConnectEndpoint
 	ipStack  *stack.Stack
@@ -70,12 +71,13 @@ func (client *EasyConnectClient) AuthTOTP(code string) ([]byte, error) {
 }
 
 func (client *EasyConnectClient) LoginByTwfId(twfId string) ([]byte, error) {
-	agentToken, err := ECAgentToken(client.server, twfId)
+	agentToken, rawSessionId, err := ECAgentToken(client.server, twfId)
 	if err != nil {
 		return nil, err
 	}
 
 	client.token = (*[48]byte)([]byte(agentToken + twfId))
+	client.serverSessionId = rawSessionId
 
 	// Query IP (keep the connection used so it's not closed too early, otherwise i/o stream will be closed)
 	client.clientIp, client.queryConn, err = QueryIp(client.server, client.token)
@@ -92,7 +94,7 @@ func (client *EasyConnectClient) ServeSocks5(socksBind string, debugDump bool) {
 	client.ipStack = SetupStack(client.clientIp, client.endpoint)
 
 	// Sangfor Easyconnect protocol
-	StartProtocol(client.endpoint, client.server, client.token,
+	StartProtocol(client.endpoint, client.server, client.token, client.serverSessionId,
 		&[4]byte{client.clientIp[3], client.clientIp[2], client.clientIp[1], client.clientIp[0]}, debugDump)
 
 	// Socks5 server

@@ -32,3 +32,10 @@ build_assets/
 
 # DMG files
 *.dmg
+
+# Packet capture files
+*.pcap
+
+# Compiled binaries
+njuconnect
+EasierConnect

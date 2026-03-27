@@ -243,7 +243,7 @@ func TOTPAuth(server string, username string, password string, twfId string, TOT
 	return twfId, nil
 }
 
-func ECAgentToken(server string, twfId string) (string, error) {
+func ECAgentToken(server string, twfId string) (string, []byte, error) {
 	dialConn, err := net.Dial("tcp", server)
 	defer dialConn.Close()
 	conn := utls.UClient(dialConn, &utls.Config{InsecureSkipVerify: true}, utls.HelloGolang)
@@ -261,8 +261,13 @@ func ECAgentToken(server string, twfId string) (string, error) {
 	n, err := conn.Read(buf)
 	if n == 0 || err != nil {
 		debug.PrintStack()
-		return "", errors.New("ECAgent Request invalid: error " + err.Error() + "\n" + string(buf[:n]))
+		return "", nil, errors.New("ECAgent Request invalid: error " + err.Error() + "\n" + string(buf[:n]))
 	}
 
-	return hex.EncodeToString(conn.HandshakeState.ServerHello.SessionId)[:31] + "\x00", nil
+	// Return both the hex-encoded token and the raw SessionId bytes
+	// The raw SessionId is needed for constructing heartbeat TLS SessionIds
+	rawSessionId := make([]byte, len(conn.HandshakeState.ServerHello.SessionId))
+	copy(rawSessionId, conn.HandshakeState.ServerHello.SessionId)
+
+	return hex.EncodeToString(conn.HandshakeState.ServerHello.SessionId)[:31] + "\x00", rawSessionId, nil
 }

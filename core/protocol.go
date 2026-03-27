@@ -20,6 +20,10 @@ func DumpHex(buf []byte) {
 }
 
 func TLSConn(server string) (*tls.UConn, error) {
+	return TLSConnWithSessionId(server, []byte{'L', '3', 'I', 'P', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0})
+}
+
+func TLSConnWithSessionId(server string, sessionId []byte) (*tls.UConn, error) {
 	// dial vpn server
 	dialConn, err := net.Dial("tcp", server)
 	if err != nil {
@@ -45,7 +49,37 @@ func TLSConn(server string) (*tls.UConn, error) {
 	conn.HandshakeState.Hello.Vers = tls.VersionTLS11
 	conn.HandshakeState.Hello.CipherSuites = []uint16{tls.TLS_RSA_WITH_RC4_128_SHA, tls.FAKE_TLS_EMPTY_RENEGOTIATION_INFO_SCSV}
 	conn.HandshakeState.Hello.CompressionMethods = []uint8{0}
-	conn.HandshakeState.Hello.SessionId = []byte{'L', '3', 'I', 'P', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	conn.HandshakeState.Hello.SessionId = sessionId
+
+	log.Println("tls: connected to: ", conn.RemoteAddr())
+
+	return conn, nil
+}
+
+// TLS 1.0 connection for heartbeats (TIMQ/JJYY)
+func TLSConnHeartbeat(server string, sessionId []byte) (*tls.UConn, error) {
+	dialConn, err := net.Dial("tcp", server)
+	if err != nil {
+		return nil, err
+	}
+
+	if tcpConn, ok := dialConn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
+	log.Println("socket: connected to: ", dialConn.RemoteAddr())
+
+	conn := tls.UClient(dialConn, &tls.Config{InsecureSkipVerify: true}, tls.HelloCustom)
+
+	random := make([]byte, 32)
+	rand.Read(random)
+	conn.SetClientRandom(random)
+	conn.SetTLSVers(tls.VersionTLS10, tls.VersionTLS10, []tls.TLSExtension{})
+	conn.HandshakeState.Hello.Vers = tls.VersionTLS10
+	conn.HandshakeState.Hello.CipherSuites = []uint16{tls.TLS_RSA_WITH_RC4_128_SHA, tls.FAKE_TLS_EMPTY_RENEGOTIATION_INFO_SCSV}
+	conn.HandshakeState.Hello.CompressionMethods = []uint8{0}
+	conn.HandshakeState.Hello.SessionId = sessionId
 
 	log.Println("tls: connected to: ", conn.RemoteAddr())
 
@@ -191,7 +225,163 @@ func BlockTXStream(server string, token *[48]byte, ipRev *[4]byte, ep *EasyConne
 	return <-errCh
 }
 
-func StartProtocol(endpoint *EasyConnectEndpoint, server string, token *[48]byte, ipRev *[4]byte, debug bool) {
+func BlockTIMQHeartbeat(server string, token *[48]byte, serverSessionId []byte, debug bool) error {
+	log.Println("TIMQ: starting heartbeat connection...")
+
+	// TIMQ SessionId = twfId(16B ASCII) + raw ServerHello SessionId(16B)
+	twfId := token[32:48]
+	timqSessionId := make([]byte, 32)
+	copy(timqSessionId[0:16], twfId)
+	copy(timqSessionId[16:32], serverSessionId)
+
+	conn, err := TLSConnHeartbeat(server, timqSessionId)
+	if err != nil {
+		log.Printf("TIMQ: TLSConn failed: %s", err.Error())
+		return err
+	}
+	defer conn.Close()
+	log.Println("TIMQ: TLS connection established")
+
+	tokenAscii := token[32:48]
+	seq := uint32(0)
+
+	// Initial handshake (type 0x04)
+	message := []byte{'T', 'I', 'M', 'Q', 0x00, 0x00, 0x00, 0x04}
+	message = append(message, byte(seq>>24), byte(seq>>16), byte(seq>>8), byte(seq))
+	message = append(message, tokenAscii...)
+
+	n, err := conn.Write(message)
+	if err != nil {
+		return err
+	}
+	if debug {
+		log.Printf("TIMQ handshake: wrote %d bytes", n)
+		DumpHex(message[:n])
+	}
+
+	reply := make([]byte, 100)
+	n, err = conn.Read(reply)
+	if err != nil {
+		return err
+	}
+	if debug {
+		log.Printf("TIMQ handshake: read %d bytes", n)
+		DumpHex(reply[:n])
+	}
+
+	if n < 4 || string(reply[0:4]) != "ACKQ" {
+		log.Printf("TIMQ: unexpected handshake reply (%d bytes): %x", n, reply[:n])
+		return errors.New("unexpected TIMQ handshake reply")
+	}
+	log.Println("TIMQ: handshake successful, starting heartbeat loop")
+
+	// Heartbeat loop (type 0x03, every 5 seconds)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		seq += 5
+		message = []byte{'T', 'I', 'M', 'Q', 0x00, 0x00, 0x00, 0x03}
+		message = append(message, byte(seq>>24), byte(seq>>16), byte(seq>>8), byte(seq))
+		message = append(message, tokenAscii...)
+
+		n, err = conn.Write(message)
+		if err != nil {
+			return err
+		}
+
+		n, err = conn.Read(reply)
+		if err != nil {
+			return err
+		}
+
+		if debug {
+			log.Printf("TIMQ heartbeat: seq=%d, wrote/read %d bytes", seq, n)
+		}
+	}
+
+	return nil
+}
+
+func BlockJJYYHeartbeat(server string, token *[48]byte, serverSessionId []byte, debug bool) error {
+	log.Println("JJYY: starting heartbeat connection...")
+
+	// JJYY uses the same SessionId format as RX/TX: L3IP prefix + serverSessionId suffix
+	jjyySessionId := make([]byte, 32)
+	copy(jjyySessionId[0:4], []byte{'L', '3', 'I', 'P'})
+	copy(jjyySessionId[16:32], serverSessionId)
+
+	conn, err := TLSConnHeartbeat(server, jjyySessionId)
+	if err != nil {
+		log.Printf("JJYY: TLSConn failed: %s", err.Error())
+		return err
+	}
+	defer conn.Close()
+	log.Println("JJYY: TLS connection established")
+
+	tokenAscii := token[32:48]
+
+	// Initial handshake (40 bytes: magic + type + zeros + tokenAscii)
+	message := []byte{'J', 'J', 'Y', 'Y', 0x00, 0x00, 0x00, 0x00}
+	message = append(message, make([]byte, 16)...)
+	message = append(message, tokenAscii...)
+
+	log.Printf("JJYY: sending handshake (%d bytes)", len(message))
+
+	n, err := conn.Write(message)
+	if err != nil {
+		return err
+	}
+	if debug {
+		log.Printf("JJYY handshake: wrote %d bytes", n)
+		DumpHex(message[:n])
+	}
+
+	reply := make([]byte, 100)
+	n, err = conn.Read(reply)
+	if err != nil {
+		return err
+	}
+	if debug {
+		log.Printf("JJYY handshake: read %d bytes", n)
+		DumpHex(reply[:n])
+	}
+
+	if n < 4 || string(reply[0:4]) != "AABB" {
+		log.Printf("JJYY: unexpected handshake reply (%d bytes): %x", n, reply[:n])
+		return errors.New("unexpected JJYY handshake reply")
+	}
+	log.Println("JJYY: handshake successful, starting heartbeat loop")
+
+	// Heartbeat loop (every 35 seconds)
+	ticker := time.NewTicker(35 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		message = []byte{'J', 'J', 'Y', 'Y', 0x00, 0x00, 0x00, 0x03}
+		message = append(message, make([]byte, 32)...)
+		message = append(message, tokenAscii...)
+		message = append(message, make([]byte, 12)...)
+
+		n, err = conn.Write(message)
+		if err != nil {
+			return err
+		}
+
+		n, err = conn.Read(reply)
+		if err != nil {
+			return err
+		}
+
+		if debug {
+			log.Printf("JJYY heartbeat: wrote/read %d bytes", n)
+		}
+	}
+
+	return nil
+}
+
+func StartProtocol(endpoint *EasyConnectEndpoint, server string, token *[48]byte, serverSessionId []byte, ipRev *[4]byte, debug bool) {
 	RX := func() {
 		counter := 0
 		for counter < 5 {
@@ -221,4 +411,38 @@ func StartProtocol(endpoint *EasyConnectEndpoint, server string, token *[48]byte
 	}
 
 	go TX()
+
+	// Heartbeats are currently disabled as the server rejects TLS 1.0 connections
+	// TCP keepalive (30s) is sufficient to prevent EOF disconnections
+	/*
+	TIMQ := func() {
+		counter := 0
+		for counter < 5 {
+			err := BlockTIMQHeartbeat(server, token, serverSessionId, debug)
+			if err != nil {
+				log.Printf("Error occurred while TIMQ heartbeat (attempt %d/5), retrying in %ds: %s", counter+1, (counter+1)*2, err.Error())
+				time.Sleep(time.Duration((counter+1)*2) * time.Second)
+			}
+			counter += 1
+		}
+		log.Println("TIMQ heartbeat retry limit exceeded.")
+	}
+
+	go TIMQ()
+
+	JJYY := func() {
+		counter := 0
+		for counter < 5 {
+			err := BlockJJYYHeartbeat(server, token, serverSessionId, debug)
+			if err != nil {
+				log.Printf("Error occurred while JJYY heartbeat (attempt %d/5), retrying in %ds: %s", counter+1, (counter+1)*2, err.Error())
+				time.Sleep(time.Duration((counter+1)*2) * time.Second)
+			}
+			counter += 1
+		}
+		log.Println("JJYY heartbeat retry limit exceeded.")
+	}
+
+	go JJYY()
+	*/
 }
