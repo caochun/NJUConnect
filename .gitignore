@@ -39,3 +39,6 @@ build_assets/
 # Compiled binaries
 njuconnect
 EasierConnect
+
+# macOS app bundle
+NJUConnect.app/
